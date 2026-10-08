@@ -1,0 +1,55 @@
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - run: uvx --exclude-newer 14d ruff check --isolated --select E,F,W,I,UP,B --line-length 120 --target-version py311 .
+
+  plugin:
+    # Host revisions are pinned on purpose; bump them by hand after reviewing a Hermes release.
+    # Only repository-controlled values are interpolated below (no event payload fields).
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - hermes: v0.21.6
+            ref: 818c13be1dc4fd28987e1e881a9408224afd4535
+    name: plugin (hermes ${{ matrix.hermes }})
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: plugin
+      - uses: actions/checkout@v4
+        with:
+          repository: NousResearch/hermes-agent
+          ref: ${{ matrix.ref }}
+          path: hermes
+      - uses: astral-sh/setup-uv@v6
+      - name: Prepare host
+        working-directory: hermes
+        run: uv sync --frozen
+      - name: Tests
+        working-directory: hermes
+        env:
+          HERMES_HOME: ${{ runner.temp }}/hermes-home
+          PYTHONPATH: ${{ github.workspace }}/hermes
+        run: uv run --with 'pytest>=8,<10' --exclude-newer 14d python -m pytest ../plugin/tests -q
+      - name: plugins doctor
+        working-directory: hermes
+        env:
+          HERMES_HOME: ${{ runner.temp }}/hermes-home
+        run: uv run python -m hermes_cli.main plugins doctor ../plugin --ci
+      - name: plugins validate (catalog admission check)
+        working-directory: hermes
+        env:
+          HERMES_HOME: ${{ runner.temp }}/hermes-home
+        run: uv run python -m hermes_cli.main plugins validate ../plugin --install-deps
