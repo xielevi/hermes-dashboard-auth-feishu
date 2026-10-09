@@ -67,6 +67,15 @@ hermes plugins enable dashboard-auth-feishu
 另外还需要租户的 **tenant_key** 和每个人的 **open_id**。open_id 是按应用分配的，别的应用（比如你的
 Hermes 机器人）拿到的 open_id 在这里对不上。
 
+最省事的取法：下面的配置先用占位值走完（`tenant_key unknown`、`owner_open_ids '["unknown"]'`），然后登录
+一次。登录会被拒，Dashboard 日志（`~/.hermes/logs/agent.log`，或进程管理器的 stderr）里会记下飞书实际返回的值：
+
+```text
+dashboard-auth-feishu: sign-in refused for tenant_key=<tenant> open_id=ou_<...>
+```
+
+填进设置、重启 Dashboard 即可。只有本来就能读这台主机日志的人才看得到这一行，里面是标识符，不是凭据。
+
 ### 2. 插件设置
 
 非敏感设置放在 `config.yaml` 的插件命名空间下：
@@ -98,13 +107,20 @@ hermes dashboard --host 127.0.0.1 --no-open
 ```
 
 反向代理指过去，登录即可。插件的回调地址也取自这个公网地址；只有两者必须不同时，才需要在插件设置里
-单独填 `public_url`。
+单独填 `public_url`。也支持路径前缀：用 `https://example.com/hermes` 时，开放平台里登记
+`https://example.com/hermes/auth/callback`。不过独立域名仍是更简单、推荐的部署方式（见「限制」）。
 
 #### 同一台机器上还在用 Hermes Desktop
 
-`dashboard.public_url` 是整台机器生效的。如果 Hermes Desktop 依赖本机的 Dashboard 后端，设了它，那个后端
-也会被门禁拦住，Desktop 会被弹到网页登录页。正确做法是不设全局键，另起一个只对外的 Dashboard，把地址放进
-它自己的环境变量：
+`dashboard.public_url` 整台机器生效，对 Desktop 的影响取决于它的后端怎么跑：
+
+- **Desktop 自己拉起的后端**（Hermes 0.21.6 及以后）：不受影响。Hermes 会豁免 Desktop 用自己的一次性
+  token 启动的 loopback 后端，设全局键没问题。
+- **Desktop 连接的常驻本地 Dashboard**（launchd/systemd 服务，或你自己启动的）：照样被门禁拦住，Desktop
+  会被弹到网页登录页。
+- **其他机器上的 Desktop 连公网 Dashboard**：照常走门禁，与本机后端无关。
+
+第二种情况下，不要设全局键，另起一个只对外的 Dashboard，把地址放进它自己的环境变量：
 
 ```sh
 HERMES_DASHBOARD_PUBLIC_URL=https://hermes.example.com \
@@ -137,13 +153,15 @@ HERMES_DASHBOARD_PUBLIC_URL=https://hermes.example.com \
   变量），以及 `HERMES_DASHBOARD_FEISHU_SESSION_KEY`。
 - **落盘数据**：`<HERMES_HOME>/plugin-data/dashboard-auth-feishu/session.sqlite3`，POSIX 下权限 0600。每次登录
   记录 tenant、open_id、显示名、时间戳、版本号和吊销标记；不存飞书 token，也没有密码。
-- **登录 state**：随机、一次性、绑定浏览器的 HttpOnly Cookie，5 分钟有效；回调地址必须与配置的 origin 一致。
+- **登录 state**：随机、一次性、绑定浏览器的 HttpOnly Cookie，5 分钟有效；回调地址必须与配置的公网地址一致。
 - **不向上游使用 PKCE**：这是服务端机密客户端。实测飞书 v3 token 端点会拒绝合法的 S256 challenge，所以插件
   依靠 App Secret 加上面那个绑定 Cookie 的 state。这和 PKCE 并不等价，App Secret 务必保管好。
 - **会话**：HMAC-SHA256 签名的 token，指向本地一行记录。access token 有效 12 小时；闲置 14 天或累计 30 天后
   会话结束。refresh 会轮换整对 token，前一对在 60 秒内仍可用（多标签页并发刷新），超时后若有人重放旧的
   refresh token，整个会话直接吊销。
 - **每次请求**都重新校验 tenant 和白名单，从白名单移除某人后重启即生效。
+- **日志**：登录被拒时记录飞书返回的 tenant_key 和 open_id（用于上面的首次配置）；token 交换失败只记录飞书的
+  错误码。授权码、token 和密钥一律不进日志。
 - **进程**：以 Dashboard 的权限在进程内运行。不执行 shell 命令，不起子进程或后台任务，不写配置，不改 Hermes 核心。
 
 已知限制：

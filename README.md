@@ -72,6 +72,18 @@ In the [Feishu developer console](https://open.feishu.cn/app) (or [Lark](https:/
 You also need your **tenant key** and each person's **open_id**. An open_id is issued per app, so
 an ID from a different app (your Hermes bot, say) will not match.
 
+The simplest way to find both: finish the setup below with placeholders (`tenant_key unknown`,
+`owner_open_ids '["unknown"]'`) and sign in once. The sign-in is refused, and the dashboard log
+(`~/.hermes/logs/agent.log`, or your process manager's stderr) records the exact values Feishu
+returned:
+
+```text
+dashboard-auth-feishu: sign-in refused for tenant_key=<tenant> open_id=ou_<...>
+```
+
+Put them in the settings and restart the dashboard. Only someone who can already read the host's logs
+sees this line, and it contains identifiers, not credentials.
+
 ### 2. Plugin settings
 
 Non-secret settings live under the plugin's namespace in `config.yaml`:
@@ -105,13 +117,23 @@ hermes dashboard --host 127.0.0.1 --no-open
 ```
 
 Point your reverse proxy at it and sign in. The plugin derives the callback from the same public
-URL; set `public_url` in the plugin settings only if it has to differ.
+URL; set `public_url` in the plugin settings only if it has to differ. A path prefix works too:
+with `https://example.com/hermes`, register `https://example.com/hermes/auth/callback` in the
+console. A dedicated hostname remains the simpler and recommended setup (see Limitations).
 
 #### Keeping Hermes Desktop working on the same machine
 
-`dashboard.public_url` is machine-wide. On a machine where Hermes Desktop talks to a local
-dashboard backend, setting it gates that backend too, and Desktop ends up on a web login page. Leave
-the global key unset and run a second, public-only dashboard with the URL in its own environment:
+`dashboard.public_url` is machine-wide, so what happens to Desktop depends on how its backend runs:
+
+- **Backend spawned by Desktop itself** (Hermes 0.21.6 or later): unaffected. Hermes exempts a
+  loopback backend that Desktop started with its own per-spawn token, so the global key is fine.
+- **A long-running local dashboard that Desktop connects to** (a launchd/systemd service, or any
+  dashboard you start yourself): gated like any other, and Desktop ends up on a web login page.
+- **Desktop on another machine using the public dashboard**: gated as usual; your local backend
+  is not involved.
+
+For the second case, leave the global key unset and run a separate, public-only dashboard with
+the URL in its own environment:
 
 ```sh
 HERMES_DASHBOARD_PUBLIC_URL=https://hermes.example.com \
@@ -147,7 +169,7 @@ What the plugin does, so you can decide whether to trust it:
   POSIX. Per sign-in it holds tenant, open_id, display name, timestamps, a version counter and a
   revocation flag. No Feishu tokens, no passwords.
 - **Login state**: random, single-use, bound to the browser's HttpOnly cookie, valid for 5 minutes.
-  The callback must match the configured origin.
+  The callback must match the configured public URL.
 - **No upstream PKCE**: this is a confidential server-side client. Feishu's v3 token endpoint
   rejected valid S256 challenges in testing, so the plugin relies on the app secret plus the
   cookie-bound state above. That is not equivalent to PKCE; keep the app secret private.
@@ -156,6 +178,8 @@ What the plugin does, so you can decide whether to trust it:
   pair for 60 s (parallel tabs), and revokes the whole session if an older refresh token is replayed
   after that.
 - **Every request** re-checks tenant and allow-list, so removing someone takes effect on restart.
+- **Logs**: a refused sign-in logs the tenant_key and open_id Feishu returned (for setup, above);
+  token-exchange failures log only Feishu's error code. Codes, tokens and secrets are never logged.
 - **Process**: runs in-process with the dashboard's permissions. No shell commands, subprocesses,
   background tasks, config writes or patches to Hermes core.
 

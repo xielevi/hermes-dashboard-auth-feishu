@@ -142,13 +142,16 @@ class Store:
     def mint(self, owner: str, name: str = "") -> Session:
         now = int(self.clock())
         family = secrets.token_hex(16)
-        with self.db() as db:
-            # Housekeeping: drop rows that can no longer validate (expired, or revoked over a day ago).
-            db.execute("DELETE FROM families WHERE created < ? OR seen < ? OR (revoked > 0 AND revoked < ?)",
-                       (now - ABS_TTL - 86400, now - IDLE_TTL - 86400, now - 86400))
-            db.execute("INSERT INTO families VALUES (?,?,?,?,?,?,?,?,?)",
-                       (family, self.tenant, owner, name, now, now, 0, 0, now))
-            row = db.execute("SELECT * FROM families WHERE id=?", (family,)).fetchone()
+        try:
+            with self.db() as db:
+                # Housekeeping: drop rows that can no longer validate (expired, or revoked over a day ago).
+                db.execute("DELETE FROM families WHERE created < ? OR seen < ? OR (revoked > 0 AND revoked < ?)",
+                           (now - ABS_TTL - 86400, now - IDLE_TTL - 86400, now - 86400))
+                db.execute("INSERT INTO families VALUES (?,?,?,?,?,?,?,?,?)",
+                           (family, self.tenant, owner, name, now, now, 0, 0, now))
+                row = db.execute("SELECT * FROM families WHERE id=?", (family,)).fetchone()
+        except sqlite3.Error:
+            raise ProviderError("Local session store unavailable") from None
         return self._session(row)
 
     def verify(self, token: str) -> Session | None:
@@ -209,20 +212,23 @@ class FeishuProvider(DashboardAuthProvider):
     """Server-side (confidential client) Feishu/Lark OAuth with a tenant + open_id allow-list."""
 
     name = "feishu"
-    display_name = "Feishu"
+    display_name = "Feishu"  # "Lark" when built for the Lark endpoints
 
     def __init__(self, app_id: str, app_secret: str, store: Store, public_url: str,
                  endpoints: dict | None = None, http=httpx, clock: Callable[[], float] = time.time):
         if not app_id or not app_secret:
             raise ValueError("Feishu app credentials required")
         u = urlsplit(public_url)
-        if u.scheme not in ("https", "http") or not u.netloc or u.path not in ("", "/") or u.query or u.fragment:
-            raise ValueError("public_url must be an origin such as https://hermes.example.com")
+        if u.scheme not in ("https", "http") or not u.netloc or u.query or u.fragment or "//" in u.path:
+            raise ValueError("public_url must look like https://hermes.example.com or https://example.com/hermes")
         if u.scheme == "http" and u.hostname not in _LOOPBACK:
             raise ValueError("public_url must be https unless it is loopback")
         self.app_id, self.app_secret, self.store = app_id, app_secret, store
-        self.public_url = f"{u.scheme}://{u.netloc}"
+        # A path prefix is kept, matching how Hermes builds the redirect URI from dashboard.public_url.
+        self.public_url = f"{u.scheme}://{u.netloc}{u.path}".rstrip("/")
         self.ep = endpoints or ENDPOINTS["feishu"]
+        if self.ep is ENDPOINTS["lark"]:
+            self.display_name = "Lark"
         self.http, self.clock = http, clock
         self._lock = threading.Lock()
         self._logins: dict[str, tuple[str, float]] = {}
@@ -301,8 +307,15 @@ class FeishuProvider(DashboardAuthProvider):
             raise ProviderError("Feishu identity unavailable")
         if r.status_code != 200 or body.get("code") != 0:
             raise InvalidCodeError("Identity rejected")
-        user = body.get("data") or {}
-        if user.get("tenant_key") != self.store.tenant or user.get("open_id") not in self.store.owners:
+        user = body.get("data")
+        if not isinstance(user, dict) or not isinstance(user.get("open_id"), str) \
+                or not isinstance(user.get("tenant_key"), str):
+            raise ProviderError("Feishu identity response malformed")
+        if user["tenant_key"] != self.store.tenant or user["open_id"] not in self.store.owners:
+            # These IDs are not secrets, and logging them is the supported way to find the values to
+            # allow-list: sign in once, read this line from the dashboard log, then configure them.
+            logger.warning("dashboard-auth-feishu: sign-in refused for tenant_key=%s open_id=%s",
+                           user["tenant_key"][:64], user["open_id"][:64])
             raise InvalidCodeError("This identity is not allowed")
         return user["open_id"], str(user.get("name") or "")[:80]
 
