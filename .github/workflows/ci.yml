@@ -20,6 +20,9 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # Lower bound: requires_hermes is >=0.21.5, which never got a final tag; rc.38 is its last build.
+          - hermes: rc.38-v0.21.5
+            ref: 08165d58931841cee713468ae89032af7c57060a
           - hermes: v0.21.6
             ref: 818c13be1dc4fd28987e1e881a9408224afd4535
     name: plugin (hermes ${{ matrix.hermes }})

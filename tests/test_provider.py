@@ -1,5 +1,7 @@
 """Provider contract and session-store behaviour, with simulated Feishu HTTP responses."""
+import logging
 import sqlite3
+import threading
 
 import pytest
 from feishu_auth_pkg import provider as P
@@ -182,10 +184,29 @@ def test_tampered_token_and_removed_owner(tmp_path, clock):
 
 def test_public_url_validation(tmp_path, clock):
     store = P.Store(tmp_path / "x.sqlite3", KEY, TENANT, frozenset([OWNER]))
-    for bad in ("http://hermes.example.com", "https://h.example.com/path", "https://h.example.com/?q", "ftp://x"):
+    for bad in ("http://hermes.example.com", "https://h.example.com/?q", "https://h.example.com/#f",
+                "https://h.example.com//x", "ftp://x"):
         with pytest.raises(ValueError):
             P.FeishuProvider("a", "s", store, bad)
     assert P.FeishuProvider("a", "s", store, "http://127.0.0.1:9119/").callback == "http://127.0.0.1:9119/auth/callback"
+
+
+def test_public_url_path_prefix(tmp_path, clock):
+    # Hermes builds redirect_uri as dashboard.public_url + "/auth/callback", prefix included.
+    store = P.Store(tmp_path / "x.sqlite3", KEY, TENANT, frozenset([OWNER]))
+    p = P.FeishuProvider("a", "s", store, "https://example.com/hermes/", http=Http())
+    assert p.callback == "https://example.com/hermes/auth/callback"
+    assert "redirect_uri=https%3A%2F%2Fexample.com%2Fhermes%2Fauth%2Fcallback" in \
+        p.start_login(redirect_uri=p.callback).redirect_url
+    with pytest.raises(ProviderError):
+        p.start_login(redirect_uri="https://example.com/auth/callback")
+
+
+def test_display_name_follows_domain(tmp_path, clock):
+    store = P.Store(tmp_path / "x.sqlite3", KEY, TENANT, frozenset([OWNER]))
+    assert P.FeishuProvider("a", "s", store, URL).display_name == "Feishu"
+    lark = P.FeishuProvider("a", "s", store, URL, P.ENDPOINTS["lark"])
+    assert lark.display_name == "Lark" and lark.name == "feishu"
 
 
 def test_store_file_is_private(tmp_path, clock):
@@ -227,3 +248,83 @@ def test_store_connections_are_closed(tmp_path, clock):
         conn = db
     with pytest.raises(sqlite3.ProgrammingError):
         conn.execute("SELECT 1")
+
+
+def test_malformed_identity_responses(tmp_path, clock):
+    for data in (None, "x", ["ou_owner"], {"tenant_key": TENANT}, {"tenant_key": TENANT, "open_id": 7},
+                 {"tenant_key": None, "open_id": OWNER}):
+        p = make(tmp_path, clock, Http(user=Resp(200, {"code": 0, "data": data})))
+        with pytest.raises(ProviderError):
+            finish(p, *login(p))
+    for user, exc in ((Resp(200, ["x"]), ProviderError), (Resp(502, ValueError("html")), ProviderError),
+                      (Resp(401, {"code": 99991663}), InvalidCodeError)):
+        p = make(tmp_path, clock, Http(user=user))
+        with pytest.raises(exc):
+            finish(p, *login(p))
+
+
+def test_refused_identity_is_logged_for_onboarding(tmp_path, clock, caplog):
+    user = Resp(200, {"code": 0, "data": {"tenant_key": "t_new", "open_id": "ou_new", "name": "N"}})
+    p = make(tmp_path, clock, Http(user=user))
+    with caplog.at_level(logging.WARNING), pytest.raises(InvalidCodeError):
+        finish(p, *login(p))
+    assert "tenant_key=t_new open_id=ou_new" in caplog.text
+    assert "uat" not in caplog.text and "secret" not in caplog.text
+
+
+def test_mint_store_failure_is_provider_error(tmp_path, clock):
+    p = make(tmp_path, clock)
+    p.store.path.unlink()
+    p.store.path.mkdir()                                             # the database file is now unusable
+    with pytest.raises(ProviderError):
+        finish(p, *login(p))
+
+
+def test_locked_store_fails_cleanly_then_recovers(tmp_path, clock):
+    p = make(tmp_path, clock)
+    s = p.store.mint(OWNER, "A")
+    clock.t += 700                                                   # verify() will want to write `seen`
+    blocker = sqlite3.connect(p.store.path)
+    blocker.execute("BEGIN EXCLUSIVE")
+    try:
+        for call in (lambda: p.verify_session(access_token=s.access_token),
+                     lambda: p.refresh_session(refresh_token=s.refresh_token),
+                     lambda: p.store.mint(OWNER, "B")):
+            with pytest.raises(ProviderError):
+                call()
+        p.revoke_session(refresh_token=s.refresh_token)              # best effort: must not raise
+    finally:
+        blocker.rollback()
+        blocker.close()
+    assert p.verify_session(access_token=s.access_token).user_id == OWNER   # nothing was revoked
+    assert p.refresh_session(refresh_token=s.refresh_token).access_token
+
+
+def test_concurrent_refresh_rotates_once(tmp_path, clock):
+    p = make(tmp_path, clock)
+    s = p.store.mint(OWNER, "A")
+    clock.t += 100
+    n, barrier, results, errors = 8, threading.Barrier(8), [], []
+
+    def worker():
+        barrier.wait()
+        for _ in range(20):                                          # ride out short lock contention
+            try:
+                results.append(p.refresh_session(refresh_token=s.refresh_token).access_token)
+                return
+            except ProviderError:
+                continue
+            except Exception as exc:                                 # noqa: BLE001
+                errors.append(exc)
+                return
+
+    threads = [threading.Thread(target=worker) for _ in range(n)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert not errors and len(results) == n
+    assert len(set(results)) == 1                                    # every tab got the same new pair
+    with p.store.db() as db:
+        row = db.execute("SELECT version, revoked FROM families").fetchone()
+    assert (row["version"], row["revoked"]) == (1, 0)

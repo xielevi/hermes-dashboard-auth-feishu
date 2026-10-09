@@ -62,6 +62,18 @@ def test_public_url_falls_back_to_host(clean_env):
     assert resolve_settings(Ctx(**settings))["public_url"] == "https://host.example.com"
 
 
+def test_unusable_store_is_a_skip_not_a_crash(clean_env, monkeypatch):
+    clean_env.setenv("FEISHU_APP_SECRET", "s")
+    from feishu_auth_pkg import provider
+
+    def boom(**_):
+        raise PermissionError("plugin-data not writable")
+    monkeypatch.setattr(provider.FeishuProvider, "from_settings", boom)
+    ctx = Ctx(**SETTINGS)
+    register(ctx)
+    assert ctx.registered == [] and "not writable" in pkg.LAST_SKIP_REASON
+
+
 def test_real_plugin_manager_registers_from_plugin_settings(tmp_path):
     home = tmp_path / "home"
     target = home / "plugins" / "dashboard-auth-feishu"

@@ -1,5 +1,5 @@
 name: dashboard-auth-feishu
-version: 1.0.0
+version: 1.0.1
 manifest_version: 2
 description: >-
   Sign in to the Hermes web dashboard with Feishu or Lark. Only an explicit
@@ -17,7 +17,6 @@ python_dependencies:
   - "httpx>=0.27,<1"
 provides_tools: []
 provides_hooks: []
-provides_middleware: []
 config_schema:
   app_id:
     type: str

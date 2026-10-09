@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import logging
 import os
+import sqlite3
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -71,7 +72,7 @@ def register(ctx) -> None:
     try:
         from .provider import FeishuProvider
         provider = FeishuProvider.from_settings(**settings)
-    except (ValueError, ImportError) as exc:
+    except (ValueError, ImportError, OSError, sqlite3.Error) as exc:
         LAST_SKIP_REASON = f"construction failed: {exc}"
         logger.warning("%s: %s", PLUGIN_NAME, LAST_SKIP_REASON)
         return
